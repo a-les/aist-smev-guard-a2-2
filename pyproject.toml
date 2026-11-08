@@ -1,0 +1,33 @@
+[project]
+name = "aist-smev-guard-a2-2"
+version = "2.0.0"
+description = "Защищённый шлюз межведомственного электронного взаимодействия и безопасности ИИ-сервисов госсектора («Щит-АИСТ / СМЭВ-Guard») с формальной верификацией криптошлюзов ViPNet (Z3 SMT) и расчётом показателя защищённости ГИС (Узи) по Приказам ФСТЭК № 17/117"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7.0",
+    "cryptography>=42.0.0",
+    "numpy>=1.26.0",
+    "z3-solver>=4.13.0",
+    "fastapi>=0.111.0",
+    "uvicorn>=0.30.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "ruff>=0.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
