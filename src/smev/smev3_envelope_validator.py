@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
-import xml.etree.ElementTree as ET
 
 from src.models.contracts import SmevAppealEnvelope, SmevAttachmentMeta
 

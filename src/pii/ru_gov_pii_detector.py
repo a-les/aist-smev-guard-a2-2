@@ -5,9 +5,8 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-import numpy as np
 from src.models.contracts import DetectedPiiSpan, PiiEntityCategory
 
 try:

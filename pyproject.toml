@@ -24,9 +24,19 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+ignore = [
+    "N999",   # Module names with numeric prefix in pipelines/
+    "S110",   # Try-except-pass in encoding decoders
+    "BLE001", # Blind except Exception in safe decoders
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
