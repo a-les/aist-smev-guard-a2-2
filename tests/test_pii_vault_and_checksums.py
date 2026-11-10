@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from src.models.contracts import PiiEntityCategory, SmevAppealEnvelope, SmevAttachmentMeta
 from src.pii.reversible_token_vault import (
     CrossCitizenLeakAttemptError,

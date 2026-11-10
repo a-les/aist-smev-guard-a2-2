@@ -7,8 +7,8 @@ import hashlib
 import hmac
 import os
 import re
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from cryptography.hazmat.primitives import hashes
@@ -61,7 +61,7 @@ class InMemoryRlsVaultBackend:
         session_bucket[entry.token_placeholder] = entry
 
     def get_session_entries(self, citizen_session_id: str) -> dict[str, EncryptedVaultEntry]:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         bucket = self._by_session.get(citizen_session_id, {})
         active: dict[str, EncryptedVaultEntry] = {}
         for token_str, entry in list(bucket.items()):
@@ -114,19 +114,19 @@ class ReversiblePiiTokenVault:
         2) tag_key — для вычисления HMAC-отпечатка сущности внутри сессии (кореференция).
         """
         salt = hashlib.sha256(
-            f"GUIT-OMSK-152FZ-SALT|{citizen_session_id}".encode("utf-8")
+            f"GUIT-OMSK-152FZ-SALT|{citizen_session_id}".encode()
         ).digest()
         hkdf_enc = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
-            info=f"AIST-PII-ENC|{citizen_session_id}|{department_mandate}".encode("utf-8"),
+            info=f"AIST-PII-ENC|{citizen_session_id}|{department_mandate}".encode(),
         )
         hkdf_tag = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
-            info=f"AIST-PII-TAG|{citizen_session_id}".encode("utf-8"),
+            info=f"AIST-PII-TAG|{citizen_session_id}".encode(),
         )
         return hkdf_enc.derive(self._master_key), hkdf_tag.derive(self._master_key)
 
@@ -144,7 +144,7 @@ class ReversiblePiiTokenVault:
         enc_key, tag_key = self._derive_session_keys(citizen_session_id, department_mandate)
         aesgcm = AESGCM(enc_key)
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         expires_at = now + timedelta(seconds=self._ttl_seconds)
 
         # Загружаем уже существующие в этой сессии токены для сохранения кореференции
@@ -164,7 +164,7 @@ class ReversiblePiiTokenVault:
         for sp in spans:
             fp = hmac.new(
                 tag_key,
-                f"{sp.category.value}:{sp.normalized_value}".encode("utf-8"),
+                f"{sp.category.value}:{sp.normalized_value}".encode(),
                 hashlib.sha256,
             ).hexdigest()
 
@@ -178,9 +178,7 @@ class ReversiblePiiTokenVault:
 
             nonce = os.urandom(12)
             aad_bytes = (
-                f"{citizen_session_id}|{department_mandate}|{sp.category.value}|{placeholder}".encode(
-                    "utf-8"
-                )
+                f"{citizen_session_id}|{department_mandate}|{sp.category.value}|{placeholder}".encode()
             )
             ciphertext = aesgcm.encrypt(nonce, sp.raw_value.encode("utf-8"), aad_bytes)
 
@@ -251,9 +249,7 @@ class ReversiblePiiTokenVault:
             nonce = base64.b64decode(entry.nonce_b64)
             ciphertext = base64.b64decode(entry.ciphertext_b64)
             expected_aad = (
-                f"{citizen_session_id}|{operator_mandate}|{entry.category.value}|{placeholder}".encode(
-                    "utf-8"
-                )
+                f"{citizen_session_id}|{operator_mandate}|{entry.category.value}|{placeholder}".encode()
             )
             try:
                 plaintext_bytes = aesgcm.decrypt(nonce, ciphertext, expected_aad)

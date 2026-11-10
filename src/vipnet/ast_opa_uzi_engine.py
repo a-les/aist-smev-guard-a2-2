@@ -84,7 +84,7 @@ class VipnetAstAndUziEngine:
         lines = config_text.splitlines()
         for idx, raw_line in enumerate(lines, start=1):
             stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+            if not stripped or stripped.startswith(("#", ";")):
                 continue
             sec_match = self._SECTION_HEADER_RE.match(stripped)
             if sec_match:
