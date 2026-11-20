@@ -102,6 +102,7 @@ class PromptShieldVerdict(BaseModel):
     explanation: str
     canary_leaked: bool = Field(default=False)
     illegal_commitment_detected: bool = Field(default=False)
+    tool_hijack_detected: bool = Field(default=False)
     latency_ms: float = Field(..., ge=0.0)
 
 
