@@ -27,23 +27,26 @@ class CanaryTokenWatcher:
     Детектор и сторож канареечных меток ([CANARY-GOV-AIST-...]) для Каскада 3.
     Поддерживает:
     - Проверку статического текста на прямые и нормализованные совпадения канареек;
-    - Декодирование скрытых вложений Base64 / Hex в ответе LLM;
+    - Декодирование скрытых вложений Base64 (стандартных и URL-safe) / Hex в ответе LLM;
+    - Защиту от разрядки букв пробелами и обфускации гомоглифами и Zero-Width;
     - Потоковый анализ (Streaming) с буфером перекрытия для обнаружения канареек,
       разорванных на стыке чанков.
     """
 
     _CANARY_GENERIC_RE = re.compile(
-        r"\[\s*CANARY[-_]GOV[-_]AIST[^\]]*\]",
+        r"\[\s*CANARY[-_\s.:/]*GOV[-_\s.:/]*AIST[^\]]*\]",
         re.IGNORECASE,
     )
     _CANARY_FALLBACK_RE = re.compile(
-        r"CANARY[-_]GOV[-_]AIST",
+        r"CANARY[-_\s.:/]*GOV[-_\s.:/]*AIST",
         re.IGNORECASE,
     )
     _BASE64_CANDIDATE_RE = re.compile(
-        r"(?<![A-Za-z0-9+/=])(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})(?![A-Za-z0-9+/=])"
+        r"[A-Za-z0-9+/\-_]{16,}={0,2}"
     )
-    _HEX_CANDIDATE_RE = re.compile(r"\b(?:0x)?([0-9a-fA-F]{24,512})\b")
+    _HEX_CANDIDATE_RE = re.compile(
+        r"\b(?:0x)?([0-9a-fA-F]{16,512})\b|(?:[0-9a-fA-F]{2}[:\s-]){7,}[0-9a-fA-F]{2}"
+    )
     _ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u00ad]")
     _HOMOGLYPHS_TRANS = str.maketrans(
         {
@@ -56,7 +59,7 @@ class CanaryTokenWatcher:
     def __init__(
         self,
         canary_secret: str | None = None,
-        window_overlap: int = 64,
+        window_overlap: int = 128,
     ) -> None:
         self.canary_secret = canary_secret or os.getenv(
             "AIST_CANARY_TOKEN",
@@ -64,9 +67,13 @@ class CanaryTokenWatcher:
         )
         self.window_overlap = window_overlap
         self._stream_buffer: str = ""
+        self._norm_canary_secret = self._normalize_text(self.canary_secret).lower()
+        self._stripped_canary_secret = self.canary_secret.strip("[]").strip().lower()
 
     def _normalize_text(self, text: str) -> str:
         """Нормализует текст: удаляет Zero-Width, приводит к NFKC и латинским гомоглифам."""
+        if not text:
+            return ""
         no_zw = self._ZERO_WIDTH_RE.sub("", text)
         nfkc = unicodedata.normalize("NFKC", no_zw)
         return nfkc.translate(self._HOMOGLYPHS_TRANS)
@@ -76,8 +83,15 @@ class CanaryTokenWatcher:
         Проверяет текст на наличие утечки канареечной метки.
         Возвращает (is_leaked, explanation).
         """
-        if self.canary_secret in text:
+        if not text:
+            return False, None
+
+        lower_text = text.lower()
+        if self.canary_secret.lower() in lower_text:
             return True, f"Обнаружена точная канареечная метка: '{self.canary_secret}'"
+
+        if len(self._stripped_canary_secret) >= 6 and self._stripped_canary_secret in lower_text:
+            return True, f"Обнаружена канареечная метка без обрамления: '{self._stripped_canary_secret}'"
 
         if self._CANARY_GENERIC_RE.search(text) or self._CANARY_FALLBACK_RE.search(text):
             match = self._CANARY_GENERIC_RE.search(text) or self._CANARY_FALLBACK_RE.search(text)
@@ -86,27 +100,59 @@ class CanaryTokenWatcher:
 
         # Проверка после устранения гомоглифов и Zero-Width
         normalized = self._normalize_text(text)
-        if self.canary_secret in normalized or self._CANARY_GENERIC_RE.search(normalized) or self._CANARY_FALLBACK_RE.search(normalized):
+        norm_lower = normalized.lower()
+        if (
+            self._norm_canary_secret in norm_lower
+            or (len(self._stripped_canary_secret) >= 6 and self._stripped_canary_secret in norm_lower)
+            or self._CANARY_GENERIC_RE.search(normalized)
+            or self._CANARY_FALLBACK_RE.search(normalized)
+        ):
             return True, "Обнаружена обфусцированная канареечная метка (Zero-Width/Homoglyph)"
 
-        # Проверка декодированных Base64 / Hex фрагментов
+        # Проверка на разрядку одиночных букв пробелами (например, "[ C A N A R Y ...]")
+        despaced = re.sub(r"(?<=[A-Za-z0-9])\s+(?=[A-Za-z0-9])", "", normalized)
+        if self._CANARY_GENERIC_RE.search(despaced) or self._CANARY_FALLBACK_RE.search(despaced):
+            return True, "Обнаружена разряжённая канареечная метка"
+
+        # Проверка декодированных Base64 / Hex фрагментов (включая URL-safe и без паддинга)
         for b64_match in self._BASE64_CANDIDATE_RE.finditer(text):
+            cand = b64_match.group(0).strip()
+            pad_len = (4 - len(cand) % 4) % 4
+            cand_padded = cand + ("=" * pad_len)
+            cand_std = cand_padded.translate(str.maketrans("-_", "+/"))
             try:
-                raw_b64 = base64.b64decode(b64_match.group(0), validate=True).decode("utf-8", errors="ignore")
-                norm_b64 = self._normalize_text(raw_b64)
-                if self.canary_secret in norm_b64 or self._CANARY_GENERIC_RE.search(norm_b64) or self._CANARY_FALLBACK_RE.search(norm_b64):
-                    return True, "Обнаружена закодированная Base64 канареечная метка"
+                raw_b64 = base64.b64decode(cand_std, validate=False).decode("utf-8", errors="ignore")
+                if raw_b64:
+                    norm_b64 = self._normalize_text(raw_b64).lower()
+                    if (
+                        self.canary_secret.lower() in norm_b64
+                        or self._norm_canary_secret in norm_b64
+                        or (len(self._stripped_canary_secret) >= 6 and self._stripped_canary_secret in norm_b64)
+                        or self._CANARY_GENERIC_RE.search(raw_b64)
+                        or self._CANARY_FALLBACK_RE.search(raw_b64)
+                    ):
+                        return True, "Обнаружена закодированная Base64 канареечная метка"
             except Exception:
                 pass
 
         for hex_match in self._HEX_CANDIDATE_RE.finditer(text):
-            try:
-                raw_hex = bytes.fromhex(hex_match.group(1)).decode("utf-8", errors="ignore")
-                norm_hex = self._normalize_text(raw_hex)
-                if self.canary_secret in norm_hex or self._CANARY_GENERIC_RE.search(norm_hex) or self._CANARY_FALLBACK_RE.search(norm_hex):
-                    return True, "Обнаружена закодированная Hex канареечная метка"
-            except Exception:
-                pass
+            raw_hex_str = hex_match.group(0)
+            clean_hex = re.sub(r"^(?:0x)|[^0-9a-fA-F]", "", raw_hex_str)
+            if len(clean_hex) >= 16 and len(clean_hex) % 2 == 0:
+                try:
+                    raw_hex = bytes.fromhex(clean_hex).decode("utf-8", errors="ignore")
+                    if raw_hex:
+                        norm_hex = self._normalize_text(raw_hex).lower()
+                        if (
+                            self.canary_secret.lower() in norm_hex
+                            or self._norm_canary_secret in norm_hex
+                            or (len(self._stripped_canary_secret) >= 6 and self._stripped_canary_secret in norm_hex)
+                            or self._CANARY_GENERIC_RE.search(raw_hex)
+                            or self._CANARY_FALLBACK_RE.search(raw_hex)
+                        ):
+                            return True, "Обнаружена закодированная Hex канареечная метка"
+                except Exception:
+                    pass
 
         return False, None
 
@@ -157,21 +203,27 @@ class OutputGuard:
     """
 
     _ILLEGAL_GOV_COMMITMENT_RE = re.compile(
-        r"(?:обязуемся\s+выплатить\s+без\s+проверки|"
-        r"гарантируем\s+немедленное\s+списание\s+налог\w+|"
-        r"назначена\s+единовременная\s+выплата\s+[\d\s]*(?:000|млн|\d+)\s*руб\w*\s+в\s+обход|"
-        r"обещаем\s+перечислить\s+компенсацию\s+без\s+(?:проверки|рассмотрения))",
+        r"(?:"
+        r"(?:обязуемся|гарантируем|обещаем)\s+(?:выплатить|перечислить|выдать|начислить|списать)\s+(?:[\d\s]*(?:000|млн|\d+)\s*руб\w*\s+)?без\s+(?:проверки|рассмотрения|предоставления\s+документов)|"
+        r"(?:гарантируем|обещаем|обязуемся)\s+немедленн\w+\s+(?:списание|аннулирование)\s+(?:налог\w+|штраф\w+|задолженност\w+)|"
+        r"(?:назначена|одобрена|согласована)\s+(?:единовременная\s+)?выплата\s+[\d\s]*(?:000|млн|\d+)\s*руб\w*\s+в\s+обход|"
+        r"обещаем\s+перечислить\s+компенсацию\s+без\s+(?:проверки|рассмотрения)|"
+        r"в\s+обход\s+(?:59-фз|152-фз|проверки|регламента)\s+(?:выплат\w+|перечисл\w+|списан\w+)"
+        r")",
         re.IGNORECASE,
     )
 
     _UNAUTHORIZED_TOOL_CALL_RE = re.compile(
         r"(?:"
         r"<\s*/?\s*(?:tool_call|tool_use|function_call|execute_sql|system_override|tool|action|bash|exec|command)\b|"
-        r"\"(?:tool_calls|function_call|tool_use)\"\s*:|"
-        r"\{[^{}]*\"(?:name|function|tool)\"\s*:\s*\"(?:execute_sql|system_exec|drop_table|run_command|eval)\"|"
-        r"\b(?:DROP\s+TABLE|TRUNCATE\s+TABLE|ALTER\s+TABLE|SELECT\s+\*\s+FROM\s+pii_token_vault|"
-        r"DELETE\s+FROM\s+pii_token_vault|INSERT\s+INTO\s+pii_token_vault|UPDATE\s+pii_token_vault)\b|"
-        r"\b(?:system_exec|sh_run|bash_run|cmd_run|subprocess\.(?:Popen|run|call)|os\.system)\b|"
+        r"\[\s*(?:tool_call|tool_use|function_call|execute_sql|system_override|tool|action|bash|exec|command)\b|"
+        r"```(?:tool_call|tool_use|function_call|execute_sql|bash|sh|cmd|powershell)\b|"
+        r"['\"]?(?:tool_calls|function_call|tool_use)['\"]?\s*:|"
+        r"\{[^{}]*['\"]?(?:name|function|tool|action)['\"]?\s*:\s*['\"]?(?:execute_sql|system_exec|drop_table|run_command|eval|shell|bash|exec|cmd|powershell)|"
+        r"\b(?:DROP\s+TABLE|TRUNCATE\s+TABLE|ALTER\s+TABLE)\b|"
+        r"\b(?:SELECT|DELETE\s+FROM|INSERT\s+INTO|UPDATE)\s+[\s\S]{0,100}?\b(?:pii_token_vault|fstec_security_audit_log)\b|"
+        r"\b(?:system_exec|sh_run|bash_run|cmd_run|subprocess\.(?:Popen|run|call|check_output)|os\.system)\b|"
+        r"\b(?:eval|exec)\s*\([^)]*['\"]|"
         r"\bcat\s+/(?:etc/passwd|etc/shadow)|\bpowershell(?:\.exe)?\s+-[eE]"
         r")",
         re.IGNORECASE,
@@ -198,15 +250,29 @@ class OutputGuard:
             return True, f"Обнаружено юридически ничтожное финансовое обязательство: '{match.group(0)[:60]}'"
         return False, None
 
-    def inspect_output(self, llm_output_text: str) -> PromptShieldVerdict:
+    def inspect_output(self, llm_output_text: str | None) -> PromptShieldVerdict:
         """
         Комплексная инспекция сгенерированного ответа LLM перед детокенизацией и отправкой оператору.
         """
         t0 = time.perf_counter()
+        clean_text = llm_output_text or ""
+        if not clean_text:
+            return PromptShieldVerdict(
+                is_blocked=False,
+                triggered_stage="NONE",
+                risk_score=0.0,
+                attack_family="BENIGN_OUTPUT",
+                normalized_text="",
+                explanation="Пустой ответ LLM «АИСТ».",
+                canary_leaked=False,
+                illegal_commitment_detected=False,
+                tool_hijack_detected=False,
+                latency_ms=0.0,
+            )
 
-        canary_leaked, canary_reason = self.canary_watcher.check_text(llm_output_text)
-        tool_hijack, tool_reason = self.check_tool_hijacking(llm_output_text)
-        illegal_promise, promise_reason = self.check_illegal_commitments(llm_output_text)
+        canary_leaked, canary_reason = self.canary_watcher.check_text(clean_text)
+        tool_hijack, tool_reason = self.check_tool_hijacking(clean_text)
+        illegal_promise, promise_reason = self.check_illegal_commitments(clean_text)
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 
         if canary_leaked or tool_hijack or illegal_promise:
@@ -241,7 +307,7 @@ class OutputGuard:
             triggered_stage="NONE",
             risk_score=0.0,
             attack_family="BENIGN_OUTPUT",
-            normalized_text=llm_output_text,
+            normalized_text=clean_text,
             explanation="Ответ LLM «АИСТ» чист (канарейки и запрещённые конструкции отсутствуют).",
             canary_leaked=False,
             illegal_commitment_detected=False,
@@ -252,11 +318,14 @@ class OutputGuard:
     def filter_streaming_response(self, stream: Iterable[str]) -> Iterator[str]:
         """
         Фильтрует потоковый вывод LLM, проверяя каждый чанк через CanaryTokenWatcher и эвристики инструментов.
+        Ограничивает скользящий буфер 1024 символами для защиты от O(N^2) DoS.
         """
         self.canary_watcher.reset()
         stream_acc = ""
         for chunk in stream:
             stream_acc += chunk
+            if len(stream_acc) > 1024:
+                stream_acc = stream_acc[-1024:]
             leaked, _ = self.canary_watcher.feed_chunk(chunk)
             tool_hijack, _ = self.check_tool_hijacking(stream_acc)
             illegal_promise, _ = self.check_illegal_commitments(stream_acc)
@@ -408,10 +477,12 @@ class ThreeStageGovPromptShield:
         )
         self._ort_session: Any | None = onnx_session
         if self._ort_session is None and ort is not None and os.path.isfile(self.onnx_classifier_path):
-            self._ort_session = ort.InferenceSession(
-                self.onnx_classifier_path,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
+            try:
+                available_providers = ort.get_available_providers()
+                providers = [p for p in ["CUDAExecutionProvider", "CPUExecutionProvider"] if p in available_providers] or ["CPUExecutionProvider"]
+                self._ort_session = ort.InferenceSession(self.onnx_classifier_path, providers=providers)
+            except Exception:
+                self._ort_session = None
 
         # Банк канареек Каскада 2
         self._canary_corpus: list[tuple[str, str]] = list(canary_corpus or self._DEFAULT_CANARY_ATTACK_CORPUS)
@@ -548,10 +619,14 @@ class ThreeStageGovPromptShield:
         Использует сессию ONNX Runtime INT8 (DeBERTa-v3/ModernBERT) при наличии,
         либо калиброванный семантический классификатор риск-признаков.
         """
+        if not text:
+            return 0.0
+
         if self._ort_session is not None:
             try:
                 inputs = self._ort_session.get_inputs()
                 input_feed: dict[str, Any] = {}
+                token_ids: list[int] | None = None
                 for inp in inputs:
                     name = inp.name
                     type_str = str(inp.type).lower()
@@ -559,15 +634,28 @@ class ThreeStageGovPromptShield:
                         input_feed[name] = np.array([text], dtype=object)
                     elif "float" in type_str:
                         input_feed[name] = np.array([self._embed_text_1024d(text)], dtype=np.float32)
+                    elif "attention_mask" in name.lower():
+                        if token_ids is None:
+                            token_ids = [ord(c) % 30522 for c in text[:128]] or [0]
+                        input_feed[name] = np.ones((1, len(token_ids)), dtype=np.int64)
+                    elif "token_type" in name.lower():
+                        if token_ids is None:
+                            token_ids = [ord(c) % 30522 for c in text[:128]] or [0]
+                        input_feed[name] = np.zeros((1, len(token_ids)), dtype=np.int64)
                     elif "int" in type_str:
-                        token_ids = [ord(c) % 30522 for c in text[:128]] or [0]
+                        if token_ids is None:
+                            token_ids = [ord(c) % 30522 for c in text[:128]] or [0]
                         input_feed[name] = np.array([token_ids], dtype=np.int64)
                     else:
                         input_feed[name] = np.array([text], dtype=object)
 
                 outputs = self._ort_session.run(None, input_feed)
                 if outputs:
-                    arr = np.asarray(outputs[0], dtype=np.float32).ravel()
+                    target_out = outputs[0]
+                    if len(outputs) > 1 and np.issubdtype(outputs[0].dtype, np.integer):
+                        target_out = outputs[1]
+
+                    arr = np.asarray(target_out, dtype=np.float32).ravel()
                     if len(arr) == 1:
                         val = float(arr[0])
                         if 0.0 <= val <= 1.0:
@@ -604,13 +692,25 @@ class ThreeStageGovPromptShield:
             return min(0.92, 0.45 + 0.22 * len(matched_markers))
         return 0.0
 
-    def inspect_ingress_prompt(self, raw_text: str) -> PromptShieldVerdict:
+    def inspect_ingress_prompt(self, raw_text: str | None) -> PromptShieldVerdict:
         """
         Последовательно прогоняет входной текст обращения и извлечённый текст вложений СМЭВ 3.0
         через Каскад 1 (Unicode + Decode + YARA/Regex) и Каскад 2 (ONNX DeBERTa-v3 + BGE-M3 Canary).
         """
         t0 = time.perf_counter()
-        normalized = self.normalize_and_decode_stage1(raw_text)
+        clean_input = raw_text or ""
+        if not clean_input.strip():
+            return PromptShieldVerdict(
+                is_blocked=False,
+                triggered_stage="NONE",
+                risk_score=0.0,
+                attack_family="BENIGN",
+                normalized_text="",
+                explanation="Пустой входной текст обращения гражданина.",
+                latency_ms=0.0,
+            )
+
+        normalized = self.normalize_and_decode_stage1(clean_input)
 
         # Каскад 1: Детерминированные сигнатуры
         for family, pattern in self._STAGE1_SIGNATURES:

@@ -498,3 +498,95 @@ def test_fastapi_gateway_end_to_end_pipeline() -> None:
         },
     )
     assert atk_resp.status_code == 403
+
+
+def test_cascade2_and_cascade3_hardened_defenses_and_edge_cases() -> None:
+    # 1. Защита от утечки канареек через URL-safe Base64 и неполный паддинг
+    custom_secret = "[CANARY-GOV-AIST-CUSTOM-99]"
+    watcher = CanaryTokenWatcher(canary_secret=custom_secret)
+    guard = OutputGuard(canary_watcher=watcher)
+
+    url_safe_b64 = base64.urlsafe_b64encode(custom_secret.encode("utf-8")).decode("ascii").rstrip("=")
+    v_b64_url = guard.inspect_output(f"Секретный токен: {url_safe_b64}")
+    assert v_b64_url.is_blocked is True
+    assert v_b64_url.canary_leaked is True
+
+    # 2. Нечувствительность к регистру и канарейка без обрамляющих скобок
+    v_lower_no_brackets = guard.inspect_output("Утечка ключа: canary-gov-aist-custom-99 в открытом виде")
+    assert v_lower_no_brackets.is_blocked is True
+    assert v_lower_no_brackets.canary_leaked is True
+
+    # 3. Разрядка одиночных букв пробелами и вариации разделителей
+    v_spaced = guard.inspect_output("Код: [ C A N A R Y - G O V - A I S T - C U S T O M - 9 9 ]")
+    assert v_spaced.is_blocked is True
+    assert v_spaced.canary_leaked is True
+
+    v_delims = guard.inspect_output("Код: [CANARY GOV AIST 9F8A 2026]")
+    assert v_delims.is_blocked is True
+    assert v_delims.canary_leaked is True
+
+    # 4. Tool Hijacking с одинарными кавычками в JSON
+    single_quote_json = "{'tool_calls': [{'name': 'execute_sql', 'arguments': 'SELECT 1'}]}"
+    v_sq_json = guard.inspect_output(f"Вызов: {single_quote_json}")
+    assert v_sq_json.is_blocked is True
+    assert v_sq_json.tool_hijack_detected is True
+
+    # 5. Выборка колонок и деструктивные запросы к pii_token_vault и fstec_security_audit_log
+    v_sql_cols = guard.inspect_output("Запрос: SELECT snils, passport_series FROM pii_token_vault WHERE id > 0")
+    assert v_sql_cols.is_blocked is True
+    assert v_sql_cols.tool_hijack_detected is True
+
+    v_audit_tamper = guard.inspect_output("Команда: DELETE FROM fstec_security_audit_log WHERE record_id = 1")
+    assert v_audit_tamper.is_blocked is True
+    assert v_audit_tamper.tool_hijack_detected is True
+
+    # 6. Маркеры вызова инструментов в квадратных скобках и блоках кода markdown
+    v_bracket_tool = guard.inspect_output("[TOOL_CALL] execute_sql SELECT 1")
+    assert v_bracket_tool.is_blocked is True
+    assert v_bracket_tool.tool_hijack_detected is True
+
+    v_codefence = guard.inspect_output("```tool_call\n{'action': 'run_command'}\n```")
+    assert v_codefence.is_blocked is True
+    assert v_codefence.tool_hijack_detected is True
+
+    # 7. Null/None безопасность
+    shield = ThreeStageGovPromptShield()
+    v_none_ingress = shield.inspect_ingress_prompt(None)
+    assert v_none_ingress.is_blocked is False
+    assert v_none_ingress.risk_score == 0.0
+
+    v_none_egress = guard.inspect_output(None)
+    assert v_none_egress.is_blocked is False
+    assert v_none_egress.canary_leaked is False
+
+    # 8. Проверка ONNX с несколькими входами (input_ids, attention_mask, token_type_ids)
+    class MockTransformerOrtSession:
+        def __init__(self) -> None:
+            self.passed_inputs: dict[str, Any] = {}
+
+        def get_inputs(self) -> list[Any]:
+            class Meta:
+                def __init__(self, name: str, type_str: str) -> None:
+                    self.name = name
+                    self.type = type_str
+
+            return [
+                Meta("input_ids", "tensor(int64)"),
+                Meta("attention_mask", "tensor(int64)"),
+                Meta("token_type_ids", "tensor(int64)"),
+            ]
+
+        def run(self, output_names: Any, input_feed: dict[str, Any]) -> list[np.ndarray]:
+            self.passed_inputs = input_feed
+            # attention_mask должен состоять из единиц (np.ones)
+            assert np.all(input_feed["attention_mask"] == 1)
+            # token_type_ids должен состоять из нулей (np.zeros)
+            assert np.all(input_feed["token_type_ids"] == 0)
+            # Возвращаем логиты для [benign, injection]
+            return [np.array([[-3.0, 4.0]], dtype=np.float32)]
+
+    transformer_mock = MockTransformerOrtSession()
+    shield_transformer = ThreeStageGovPromptShield(onnx_session=transformer_mock)
+    prob = shield_transformer.predict_onnx_classifier("Тестовый запрос с проверкой attention_mask")
+    assert prob > 0.99
+
