@@ -127,9 +127,10 @@ class Z3VipnetSmtVerifier:
 
     @staticmethod
     def _parse_cidr(selector: str) -> IPv4Network:
-        if selector in ("@any", "*", "0.0.0.0/0", "any"):
+        norm = selector.strip().lower()
+        if norm in ("@any", "*", "0.0.0.0/0", "any"):
             return IPv4Network("0.0.0.0/0")
-        return IPv4Network(selector, strict=False)
+        return IPv4Network(norm, strict=False)
 
     @staticmethod
     def _normalize_proto(proto_str: str) -> str:
@@ -155,9 +156,10 @@ class Z3VipnetSmtVerifier:
 
     @staticmethod
     def cidr_to_z3_pred(ip_var: Any, selector: str) -> Any:
-        if selector in ("@any", "*", "0.0.0.0/0", "any"):
+        norm = selector.strip().lower()
+        if norm in ("@any", "*", "0.0.0.0/0", "any"):
             return z3.BoolVal(True)
-        net = IPv4Network(selector, strict=False)
+        net = IPv4Network(norm, strict=False)
         mask_bv = z3.BitVecVal(int(net.netmask), 32)
         net_bv = z3.BitVecVal(int(net.network_address), 32)
         return (ip_var & mask_bv) == net_bv
@@ -441,11 +443,15 @@ class Z3VipnetSmtVerifier:
         Проверяет список правил ViPNet на Rule Shadowing, Split-Tunneling Cleartext Leak и MTU Drop.
         Возвращает список формально доказанных находок с точными контрпримерами пакетов из модели Z3.
         """
-        tunnels = configured_tunnels or [
-            (r.subject_cidr_or_role, r.resource_cidr_or_uri)
-            for r in rules
-            if r.section == "tunnel" and r.effect == "encrypt_tunnel"
-        ]
+        tunnels = (
+            configured_tunnels
+            if configured_tunnels is not None
+            else [
+                (r.subject_cidr_or_role, r.resource_cidr_or_uri)
+                for r in rules
+                if r.section == "tunnel" and r.effect == "encrypt_tunnel"
+            ]
+        )
 
         if not HAS_Z3:
             return self._verify_fallback_interval_smt(rules, gis_protected_pair, tunnels)
@@ -632,9 +638,32 @@ class Z3VipnetSmtVerifier:
         Формирует валидный отчёт статического/формального анализа в международном и ГОСТ-совместимом
         формате SARIF 2.1.0 для загрузки в SourceCraft Code Security и панель SOC.
         """
+        catalog_index_map: dict[str, int] = {
+            r_spec["id"]: idx for idx, r_spec in enumerate(cls.SARIF_RULES_CATALOG)
+        }
+
         results: list[dict[str, Any]] = []
         for f in findings:
             level = "error" if f.severity in ("CRITICAL", "HIGH") else "warning"
+
+            # Привязываем находку к каноническому правилу из SARIF_RULES_CATALOG (OASIS §3.27.5 & §3.27.7)
+            if f.finding_id.startswith("Z3-LEAK-"):
+                matched_rule_id = "ЗКС.1"
+            elif f.finding_id.startswith("Z3-SHADOW-"):
+                matched_rule_id = "МСЭ.1"
+            elif f.finding_id.startswith("Z3-MTU-MIN-"):
+                matched_rule_id = "ЗКС.2-MIN"
+            elif f.finding_id.startswith("Z3-MTU-"):
+                matched_rule_id = "ЗКС.2"
+            elif f.fstec_measure in catalog_index_map:
+                matched_rule_id = f.fstec_measure
+            else:
+                prefix = f.fstec_measure.split("/")[0].strip()
+                matched_rule_id = prefix if prefix in catalog_index_map else "ЗКС.1"
+
+            rule_idx = catalog_index_map.get(matched_rule_id, 0)
+            start_ln = max(1, f.span.line_start)
+            end_ln = max(start_ln, f.span.line_end)
 
             fixes: list[dict[str, Any]] = []
             if f.suggested_patch_diff:
@@ -649,8 +678,8 @@ class Z3VipnetSmtVerifier:
                                 "replacements": [
                                     {
                                         "deletedRegion": {
-                                            "startLine": f.span.line_start,
-                                            "endLine": f.span.line_end,
+                                            "startLine": start_ln,
+                                            "endLine": end_ln,
                                         },
                                         "insertedContent": {"text": f.suggested_patch_diff},
                                     }
@@ -661,7 +690,8 @@ class Z3VipnetSmtVerifier:
                 )
 
             res_obj: dict[str, Any] = {
-                "ruleId": f.fstec_measure,
+                "ruleId": matched_rule_id,
+                "ruleIndex": rule_idx,
                 "level": level,
                 "message": {"text": f.description},
                 "locations": [
@@ -669,8 +699,8 @@ class Z3VipnetSmtVerifier:
                         "physicalLocation": {
                             "artifactLocation": {"uri": f.span.file_path},
                             "region": {
-                                "startLine": f.span.line_start,
-                                "endLine": f.span.line_end,
+                                "startLine": start_ln,
+                                "endLine": end_ln,
                             },
                         }
                     }
@@ -678,6 +708,7 @@ class Z3VipnetSmtVerifier:
                 "properties": {
                     "finding_id": f.finding_id,
                     "cwe_id": f.cwe_id,
+                    "fstec_measure": f.fstec_measure,
                     "z3_counterexample": f.z3_counterexample,
                     "suggested_patch_diff": f.suggested_patch_diff,
                 },

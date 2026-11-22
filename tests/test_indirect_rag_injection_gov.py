@@ -625,6 +625,15 @@ def test_p09_pyrit_converters_suite() -> None:
     # Пустая строка
     assert hg_conv.convert("") == ""
 
+    # Проверка направления lat_to_cyr и both
+    hg_lat2cyr = HomoglyphConverter(insert_zero_width=False, direction="lat_to_cyr")
+    text_lat = "acop"
+    res_lat2cyr = hg_lat2cyr.convert(text_lat)
+    assert "а" in res_lat2cyr and "с" in res_lat2cyr and "о" in res_lat2cyr and "р" in res_lat2cyr
+
+    hg_both = HomoglyphConverter(insert_zero_width=False, direction="both")
+    assert len(hg_both.convert("аc")) == 2
+
     # 2. Base64Converter
     b64_conv = Base64Converter(wrap_in_gov_appeal=True, url_safe=False)
     b64_wrapped = b64_conv.convert("секретная команда")
@@ -648,6 +657,12 @@ def test_p09_pyrit_converters_suite() -> None:
     assert "3" in leet_res  # 'e' -> '3'
     assert "1" in leet_res  # 'i' -> '1'
     assert "7" in leet_res  # 't' -> '7'
+
+    # Русские замены leetspeak
+    leet_ru = leet_conv.convert("число три базы")
+    assert "4" in leet_ru  # 'ч' -> '4'
+    assert "3" in leet_ru  # 'з' -> '3'
+    assert "6" in leet_ru  # 'б' -> '6'
 
     # 5. BureaucraticAuthorityConverter
     for t_key in ("PROSECUTOR", "FSTEC", "GUIT", "FSB", "59FZ_LEGAL", "SMEV_XML"):
@@ -685,6 +700,13 @@ def test_p09_garak_pyrit_orchestrator_suites_and_reporting() -> None:
     gov_probes = orchestrator.build_bureaucratic_suite()
     assert len(gov_probes) >= 5
     assert all(p.framework_origin == "GOV_BUREAUCRATIC_RU" for p in gov_probes)
+
+    # Проверка, что зонд GOV-FSB-DIRECTIVE-14 содержит директиву УФСБ и блокируется экраном
+    fsb_probe = next(p for p in gov_probes if p.probe_id == "GOV-FSB-DIRECTIVE-14")
+    assert "Директива УФСБ" in fsb_probe.raw_prompt_payload
+    v_fsb = shield.inspect_ingress_prompt(fsb_probe.raw_prompt_payload)
+    assert v_fsb.is_blocked is True
+    assert v_fsb.attack_family == "BUREAUCRATIC_AUTHORITY_SPOOFING_EXFIL"
 
     legit_probes = orchestrator.build_legitimate_suite()
     assert len(legit_probes) >= 4
@@ -786,8 +808,41 @@ def test_p09_garak_pyrit_custom_target_fn_and_cli(monkeypatch: pytest.MonkeyPatc
         saved_data = json.loads(saved_content)
         assert saved_data["campaign_id"] == "CLI-TEST-01"
         assert saved_data["block_rate_percent"] == 100.0
+        # 3. Тестирование запуска CLI с набором --suite legit (FRR = 0.0%, 0 атак)
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "gov_garak_pyrit_orchestrator",
+                "--suite",
+                "legit",
+                "--campaign-id",
+                "CLI-TEST-LEGIT",
+            ],
+        )
+        exit_code_legit = redteam_main()
+        assert exit_code_legit == 0
     finally:
         Path(tmp_report_path).unlink(missing_ok=True)
+
+    # 4. Проверка устойчивости к ошибкам сервера в _evaluate_remote_target
+    from io import BytesIO
+    from urllib.error import HTTPError
+
+    orch_remote = GovGarakPyritOrchestrator()
+    dummy_probe = RedTeamProbeSpec(
+        probe_id="REMOTE-TEST-01",
+        framework_origin="NVIDIA_GARAK",
+        attack_vector="Test vector",
+        raw_prompt_payload="test payload",
+        expected_blocked=True,
+    )
+
+    def mock_urlopen_500(*args: Any, **kwargs: Any) -> None:
+        raise HTTPError("http://dummy:8080", 500, "Internal Server Error", {}, BytesIO(b"Server Crash"))
+
+    monkeypatch.setattr("src.redteam.gov_garak_pyrit_orchestrator.urlopen", mock_urlopen_500)
+    with pytest.raises(ConnectionError, match="HTTP 500"):
+        orch_remote._evaluate_remote_target("http://dummy:8080", dummy_probe)
 
 
 # ==============================================================================
@@ -817,7 +872,28 @@ def test_p10_z3_smt_shadowing_single_and_union() -> None:
         assert shadow_f[0].z3_counterexample.get("shadowed_by") == "FW-FORWARD-10"
         assert "FW-FORWARD-10" in shadow_f[0].description
 
-    # 2. Непересекающиеся правила НЕ должны ложно затеняться (разные порты, подсети, протоколы)
+    # 2. Затенение ОБЪЕДИНЕНИЕМ нескольких правил (Union of Rules Shadowing)
+    # Правило 10 покрывает 10.221.0.0/25, правило 15 покрывает 10.221.0.128/25.
+    # Ни одно из них по отдельности не затеняет 10.221.0.0/24 (правило 20),
+    # но их объединение покрывает подсеть целиком!
+    union_shadow_conf = (
+        "[forward]\n"
+        "rule= num 10 proto tcp from 10.221.0.0/25 to 10.222.0.0/24 port 1-65535 pass\n"
+        "rule= num 15 proto tcp from 10.221.0.128/25 to 10.222.0.0/24 port 1-65535 pass\n"
+        "rule= num 20 proto tcp from 10.221.0.0/24 to 10.222.0.0/24 port 80 pass\n"
+    )
+    rules_u, tunnels_u = ast_engine.parse_vipnet_configs(union_shadow_conf)
+    findings_z3_u = z3_verifier.verify_rules_and_tunnels(rules_u, configured_tunnels=tunnels_u)
+    findings_fb_u = z3_verifier._verify_fallback_interval_smt(rules_u, ("10.221.0.0/24", "10.222.0.0/24"), tunnels_u)
+
+    for findings in (findings_z3_u, findings_fb_u):
+        shadow_u = [f for f in findings if f.finding_id == "Z3-SHADOW-FW-FORWARD-20"]
+        assert len(shadow_u) == 1
+        assert shadow_u[0].z3_counterexample is not None
+        assert shadow_u[0].z3_counterexample.get("shadowing_type") == "UNION_OF_RULES"
+        assert "UNSAT" in str(shadow_u[0].z3_counterexample.get("z3_status"))
+
+    # 3. Непересекающиеся правила НЕ должны ложно затеняться (разные порты, подсети, протоколы)
     disjoint_conf = (
         "[forward]\n"
         "rule= num 10 proto tcp from 10.221.0.0/24 to 10.222.0.0/24 port 80 pass\n"
@@ -881,6 +957,10 @@ def test_p10_z3_smt_split_tunneling_leak_and_counterexample() -> None:
     rules_c, tunnels_c = ast_engine.parse_vipnet_configs(full_coverage_conf)
     findings_clean = z3_verifier.verify_rules_and_tunnels(rules_c, configured_tunnels=tunnels_c)
     assert not any(f.finding_id.startswith("Z3-LEAK-") for f in findings_clean)
+
+    # 3. Передача пустого списка tunnels=[] явно (без отката на извлечение из rules)
+    findings_empty_tunnels = z3_verifier.verify_rules_and_tunnels(rules_c, configured_tunnels=[])
+    assert any(f.finding_id.startswith("Z3-LEAK-") for f in findings_empty_tunnels)
 
 
 def test_p10_z3_smt_mtu_boundaries_and_invalid_values() -> None:
@@ -949,8 +1029,14 @@ def test_p10_z3_smt_sarif_210_catalog_and_file_export(monkeypatch: pytest.Monkey
     assert "results" in sarif_doc["runs"][0]
     assert len(sarif_doc["runs"][0]["results"]) == len(findings)
 
-    # Проверка наличия fixes и recommendations в результатах SARIF
+    # Проверка наличия fixes и recommendations в результатах SARIF,
+    # а также валидность связывания каждого результата с каталогом правил driver.rules (OASIS §3.27.5 & §3.27.7)
     assert any("fixes" in res for res in sarif_doc["runs"][0]["results"])
+    for res in sarif_doc["runs"][0]["results"]:
+        assert res["ruleId"] in rule_ids
+        assert isinstance(res.get("ruleIndex"), int)
+        assert res["ruleIndex"] >= 0
+        assert "fstec_measure" in res["properties"]
 
     with tempfile.NamedTemporaryFile(suffix=".sarif", delete=False) as tmp_f:
         tmp_sarif_path = tmp_f.name
@@ -986,5 +1072,18 @@ def test_p10_z3_smt_sarif_210_catalog_and_file_export(monkeypatch: pytest.Monkey
     finally:
         Path(tmp_sarif_path).unlink(missing_ok=True)
         Path(tmp_conf_path).unlink(missing_ok=True)
+
+
+def test_p10_z3_smt_cidr_whitespace_and_casing_robustness() -> None:
+    # Проверка устойчивости к регистру и пробелам в селекторах CIDR
+    net1 = Z3VipnetSmtVerifier._parse_cidr(" ANY ")
+    assert str(net1) == "0.0.0.0/0"
+
+    net2 = Z3VipnetSmtVerifier._parse_cidr("  10.221.0.0/24  ")
+    assert str(net2) == "10.221.0.0/24"
+
+    net3 = Z3VipnetSmtVerifier._parse_cidr("0.0.0.0/0")
+    assert str(net3) == "0.0.0.0/0"
+
 
 
