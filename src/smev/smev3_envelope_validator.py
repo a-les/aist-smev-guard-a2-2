@@ -293,6 +293,17 @@ class Smev3EnvelopeValidator:
                     f"CRITICAL PAYLOAD BLOCK: Во вложении '{att.filename}' обнаружена сигнатура макроса или активного скрипта!"
                 )
 
+        # Инспекция контейнеров OpenXML/ZIP (DOCX, XLSX), переданных в сыром виде или Base64
+        if att.extracted_text.startswith("PK\x03\x04"):
+            self._inspect_container_for_macros(att.extracted_text.encode("latin1"), att.filename)
+        elif att.extracted_text.startswith("UEsDB"):  # Base64 сигнатура PK\x03\x04
+            try:
+                import base64
+                raw_zip = base64.b64decode(att.extracted_text.strip())
+                self._inspect_container_for_macros(raw_zip, att.filename)
+            except Exception:
+                pass
+
         self._check_no_internal_ssrf_urls(att.extracted_text)
         if len(att.extracted_text) > 20000:
             warnings.append(
