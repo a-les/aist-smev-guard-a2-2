@@ -574,10 +574,17 @@ class VipnetAstAndUziEngine:
             "",
             "[local]",
         ]
+        def _format_port_range(p: tuple[int, int]) -> str:
+            if p == (0, 65535):
+                return ""
+            if p[0] == p[1]:
+                return f" port {p[0]}"
+            return f" port {p[0]}-{p[1]}"
+
         for r in remediated_rules:
             if r.section == "local":
                 act_str = "pass" if r.effect == "allow" else ("encrypt" if r.effect == "encrypt_tunnel" else "drop")
-                port_str = f" port {r.port_range[0]}" if r.port_range != (0, 65535) else ""
+                port_str = _format_port_range(r.port_range)
                 lines.append(
                     f"rule = num {r.priority} proto {r.protocol_or_method} from {r.subject_cidr_or_role} to {r.resource_cidr_or_uri}{port_str} {act_str}"
                 )
@@ -586,7 +593,7 @@ class VipnetAstAndUziEngine:
         for r in remediated_rules:
             if r.section == "forward":
                 act_str = "pass" if r.effect == "allow" else ("encrypt" if r.effect == "encrypt_tunnel" else "drop")
-                port_str = f" port {r.port_range[0]}" if r.port_range != (0, 65535) else ""
+                port_str = _format_port_range(r.port_range)
                 lines.append(
                     f"rule = num {r.priority} proto {r.protocol_or_method} from {r.subject_cidr_or_role} to {r.resource_cidr_or_uri}{port_str} {act_str}"
                 )

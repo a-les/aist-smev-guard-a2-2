@@ -9,7 +9,7 @@ import rego.v1
 deny contains msg if {
     some rule in input.rules
     rule.effect == "allow"
-    rule.subject_cidr_or_role in {"@any", "0.0.0.0/0", "*"}
+    rule.subject_cidr_or_role in {"@any", "0.0.0.0/0", "*", "any"}
     rule.port_range[0] <= 22
     rule.port_range[1] >= 22
     msg := sprintf("[CRITICAL I_block=0] Нарушение МСЭ.3 / УПД.4: открыт порт SSH 22 для %s в правиле %s (строка %d)", [rule.subject_cidr_or_role, rule.rule_id, rule.span.line_start])
@@ -18,7 +18,7 @@ deny contains msg if {
 deny contains msg if {
     some rule in input.rules
     rule.effect == "allow"
-    rule.subject_cidr_or_role in {"@any", "0.0.0.0/0", "*"}
+    rule.subject_cidr_or_role in {"@any", "0.0.0.0/0", "*", "any"}
     rule.port_range[0] <= 8000
     rule.port_range[1] >= 8000
     msg := sprintf("[CRITICAL I_block=0] Нарушение ИИ.2 / ЗИС.3: прямой доступ @any к внутреннему порту LLM АИСТ (8000) в правиле %s (строка %d)", [rule.rule_id, rule.span.line_start])

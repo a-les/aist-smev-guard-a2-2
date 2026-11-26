@@ -58,7 +58,9 @@ def test_ogrn_luhn_passport_uin_and_bank_account_validators() -> None:
     assert ok_ogrn is True
     assert cat_ogrn == PiiEntityCategory.OGRN
 
-    assert isinstance(verify_luhn_checksum("5500 1234 5678 9012"), bool)
+    # Проверка карты Мир по алгоритму Луна (2200 1234 5678 9019 валидна, 9010 невалидна)
+    assert verify_luhn_checksum("2200 1234 5678 9019") is True
+    assert verify_luhn_checksum("2200 1234 5678 9010") is False
     # Серия 52 (Омская область), год 19, номер 123456
     assert verify_rf_passport_series_number("52 19 123456") is True
     # Несуществующий код ОКАТО 00
@@ -370,4 +372,44 @@ def test_fastapi_remediation_endpoint() -> None:
     assert data["remediated_report"]["final_uzi"] >= 0.85
     assert data["is_target_met"] is True
     assert len(data["applied_actions"]) >= 1
+
+
+def test_vault_delimiter_injection_blocked_and_fio_no_collision() -> None:
+    vault = ReversiblePiiTokenVault()
+
+    # Попытка инъекции разделителя '|' в citizen_session_id или mandate обязана пресекаться
+    with pytest.raises(ValueError, match="Недопустимый символ разделителя"):
+        vault.tokenize_citizen_text(
+            text="Заявление гражданина Иванова Сергея Петровича",
+            citizen_session_id="SESS_01|OMSK_GUIT_OPERATOR|SNILS",
+            department_mandate="OMSK_GUIT",
+        )
+
+    # Проверка отсутствия коллизии между «Петров Петр Петрович» и «Петренко Петр Петрович»
+    from src.pii.ru_gov_pii_detector import normalize_ru_fio_canonical_key
+    key_petrov = normalize_ru_fio_canonical_key("Петров Петр Петрович")
+    key_petrenko = normalize_ru_fio_canonical_key("Петренко Петр Петрович")
+    assert key_petrov != key_petrenko
+
+
+def test_whatif_synthesis_preserves_port_ranges() -> None:
+    engine = VipnetAstAndUziEngine()
+    conf = (
+        "[forward]\n"
+        "rule = num 1 proto tcp from @any to 10.221.0.5 port 1024-65535 pass\n"
+    )
+    result = engine.simulate_remediation_what_if(
+        config_or_rules=conf,
+        remediations=[
+            RemediationAction(
+                action_type="RESTRICT_SUBNET",
+                target_rule_id="FW-FORWARD-1",
+                parameters={"trusted_cidr": "10.221.0.0/24"},
+                description="Сужение диапазона",
+            )
+        ],
+    )
+    # Проверяем, что синтезатор сохранил диапазон 'port 1024-65535', а не урезал до 'port 1024'
+    assert "port 1024-65535" in result.remediated_config_text
+
 

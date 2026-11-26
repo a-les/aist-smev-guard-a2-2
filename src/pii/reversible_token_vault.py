@@ -119,7 +119,13 @@ class ReversiblePiiTokenVault:
     5) Криптографическое забывание сессии по ст. 21 152-ФЗ.
     """
 
-    _TOKEN_PLACEHOLDER_RE = re.compile(r"<([A-Z_]+)_\d{2}>")
+    _TOKEN_PLACEHOLDER_RE = re.compile(r"<([A-Z_]+)_\d+>")
+
+    @staticmethod
+    def _validate_safe_identifier(val: str, name: str) -> str:
+        if "|" in val or "\n" in val or "\r" in val:
+            raise ValueError(f"Недопустимый символ разделителя в {name}: {val!r}")
+        return val
 
     def __init__(
         self,
@@ -151,6 +157,8 @@ class ReversiblePiiTokenVault:
         1) enc_key — для шифрования AES-256-GCM с привязкой к сессии и мандату;
         2) tag_key — для вычисления HMAC-отпечатка сущности внутри сессии (кореференция).
         """
+        self._validate_safe_identifier(citizen_session_id, "citizen_session_id")
+        self._validate_safe_identifier(department_mandate, "department_mandate")
         salt = hashlib.sha256(
             f"GUIT-OMSK-152FZ-SALT|{citizen_session_id}".encode()
         ).digest()
@@ -176,6 +184,8 @@ class ReversiblePiiTokenVault:
         placeholder: str,
     ) -> bytes:
         """Детерминированное формирование AAD для криптографической аутентификации блока токена."""
+        if any("|" in s for s in (citizen_session_id, department_mandate, category, placeholder)):
+            raise ValueError("Символ '|' запрещен в атрибутах AAD во избежание коллизий контекста")
         return f"{citizen_session_id}|{department_mandate}|{category}|{placeholder}".encode()
 
     def tokenize_citizen_text(

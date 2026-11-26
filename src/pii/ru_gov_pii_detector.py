@@ -228,9 +228,9 @@ def normalize_ru_fio_canonical_key(raw_fio: str) -> str:
     else:
         gender = "u"
         patr_stem = patr
-    sur_stem = _SURNAME_SUFFIX_RE.sub("", sur) or sur[:4]
-    first_stem = _FIRSTNAME_SUFFIX_RE.sub("", first) or first[:3]
-    patr_stem = _FIRSTNAME_SUFFIX_RE.sub("", patr_stem) or patr_stem[:4]
+    sur_stem = _SURNAME_SUFFIX_RE.sub("", sur) or sur
+    first_stem = _FIRSTNAME_SUFFIX_RE.sub("", first) or first
+    patr_stem = _FIRSTNAME_SUFFIX_RE.sub("", patr_stem) or patr_stem
     return f"{gender}:{sur_stem}:{first_stem}:{patr_stem}"
 
 
