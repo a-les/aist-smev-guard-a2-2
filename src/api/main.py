@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 from src.crypto.fstec_streebog_audit_logger import FstecStreebogAuditLogger
 from src.guardrails.three_stage_prompt_shield import ThreeStageGovPromptShield
-from src.models.contracts import SmevAppealEnvelope
+from src.models.contracts import RemediationAction, SmevAppealEnvelope
 from src.pii.reversible_token_vault import (
     CrossCitizenLeakAttemptError,
     ReversiblePiiTokenVault,
@@ -85,6 +85,13 @@ class OperatorDeanonRequest(BaseModel):
 class VipnetAuditRequest(BaseModel):
     config_text: str = Field(..., min_length=10)
     measures_by_group: dict[str, list[float]] = Field(default_factory=dict)
+
+
+class VipnetRemediationRequest(BaseModel):
+    config_text: str = Field(..., min_length=10)
+    measures_by_group: dict[str, list[float]] = Field(default_factory=dict)
+    actions: list[RemediationAction] | None = None
+    target_threshold: float = Field(default=0.85, ge=0.5, le=1.0)
 
 
 class RedTeamRequest(BaseModel):
@@ -305,6 +312,33 @@ def verify_vipnet_and_calculate_uzi(
         "z3_findings": [f.model_dump() for f in z3_findings],
         "sarif_210": sarif_doc,
     }
+
+
+@app.post("/v1/vipnet/simulate-remediation")
+def simulate_vipnet_remediation(req: VipnetRemediationRequest) -> dict[str, Any]:
+    """
+    Симулирует ремедиацию конфигураций ViPNet Coordinator (What-If анализ),
+    устраняя блокирующие нарушения, пересчитывая показатель защищенности ГИС U_зи
+    и формируя пропатченную конфигурацию.
+    """
+    rules, tunnels = vipnet_uzi_engine.parse_vipnet_configs(req.config_text)
+    z3_findings = z3_verifier.verify_rules_and_tunnels(
+        rules, configured_tunnels=tunnels
+    )
+    has_leak = any(f.finding_id.startswith("Z3-LEAK-") for f in z3_findings)
+
+    whatif_result = vipnet_uzi_engine.simulate_remediation_what_if(
+        config_or_rules=req.config_text,
+        remediations=req.actions,
+        measures_by_group=req.measures_by_group,
+        z3_has_cleartext_leak=has_leak,
+        target_threshold=req.target_threshold,
+    )
+    METRICS_STATE["aist_guard_fstec_uzi_score"] = (
+        whatif_result.remediated_report.final_uzi
+    )
+    return whatif_result.model_dump()
+
 
 
 @app.get("/v1/audit/verify-chain")

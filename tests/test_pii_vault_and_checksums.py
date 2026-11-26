@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from src.models.contracts import PiiEntityCategory, SmevAppealEnvelope, SmevAttachmentMeta
+from src.models.contracts import (
+    PiiEntityCategory,
+    RemediationAction,
+    SmevAppealEnvelope,
+    SmevAttachmentMeta,
+)
 from src.pii.reversible_token_vault import (
     CrossCitizenLeakAttemptError,
     ReversiblePiiTokenVault,
@@ -220,3 +225,149 @@ def test_two_contour_fstec_117_uzi_score_calculation() -> None:
     assert report_blocked.i_block_multiplier == 0.0
     assert report_blocked.final_uzi == 0.0
     assert report_blocked.compliance_status == "NON_COMPLIANT_BLOCKED"
+
+
+def test_lark_ebnf_ast_parsing_and_source_spans() -> None:
+    engine = VipnetAstAndUziEngine()
+    config_sample = (
+        "# Файл iplir.conf узла ViPNet Coordinator\n"
+        "[id]\n"
+        "id = 0x00010001\n"
+        "name = aist-gw\n"
+        "tunnel = 10.221.0.0-10.221.0.255\n"
+        "mtu = 1360\n"
+        "\n"
+        "[local]\n"
+        "rule = num 1 proto tcp from 10.55.10.0/24 to 10.55.10.1 port 22 pass\n"
+        "rule = num 2 proto icmp from any to 10.55.10.1 pass\n"
+        "\n"
+        "[forward]\n"
+        "rule = num 3 proto tcp from 10.55.10.0/24 to 10.221.0.5 port 8000 pass\n"
+        "rule = num 4 proto udp from 10.221.0.0/24 to 10.221.1.0/24 port 1024-65535 pass\n"
+        "rule = num 5 proto ip from 10.221.0.0/24 to 10.221.1.0/24 encrypt\n"
+    )
+
+    rules, tunnels = engine.parse_vipnet_configs(config_sample, file_path="/etc/vipnet/iplir.conf")
+    assert len(rules) == 6  # 5 firewall rules + 1 tunnel rule from [id]
+    assert len(tunnels) == 1
+    assert tunnels[0] == ("10.221.0.0/24", "10.221.0.0/24")
+
+    # Проверка типов и SourceSpan
+    r1 = next(r for r in rules if r.rule_id == "FW-LOCAL-1")
+    assert r1.section == "local"
+    assert r1.protocol_or_method == "tcp"
+    assert r1.port_range == (22, 22)
+    assert r1.effect == "allow"
+    assert r1.span.file_path == "/etc/vipnet/iplir.conf"
+    assert r1.span.line_start == 9
+
+    r4 = next(r for r in rules if r.rule_id == "FW-FORWARD-4")
+    assert r4.port_range == (1024, 65535)
+    assert r4.protocol_or_method == "udp"
+
+    r5 = next(r for r in rules if r.rule_id == "FW-FORWARD-5")
+    assert r5.effect == "encrypt_tunnel"
+
+
+def test_whatif_remediation_auto_synthesis_and_recovery() -> None:
+    engine = VipnetAstAndUziEngine()
+    vulnerable_config = (
+        "[id]\n"
+        "id = 0x00010001\n"
+        "name = aist-gw\n"
+        "tunnel = 10.221.0.0-10.221.0.255\n"
+        "mtu = 1500\n"  # MTU > 1400 (ЗКС.2)
+        "\n"
+        "[local]\n"
+        "rule = num 1 proto tcp from @any to 10.55.10.1 port 22 pass\n"  # Блокирующее SSH (МСЭ.3)
+        "\n"
+        "[forward]\n"
+        "rule = num 2 proto tcp from @any to 10.221.0.5 port 8000 pass\n"  # Блокирующее LLM (ИИ.2)
+    )
+
+    result = engine.simulate_remediation_what_if(
+        config_or_rules=vulnerable_config,
+        measures_by_group={
+            "ИАФ": [0.95],
+            "УПД": [0.60],  # занижено из-за нарушения
+            "МСЭ": [0.50],  # занижено из-за @any на порты
+            "ЗКС": [0.70],  # занижено из-за MTU
+            "РСБ": [0.95],
+            "АНЗ": [0.95],
+            "ИИ": [0.60],   # занижено из-за открытого 8000
+        },
+        z3_has_cleartext_leak=True,  # Z3 зафиксировал утечку туннеля
+        gis_class="K1",
+        target_threshold=0.85,
+    )
+
+    # Исходное состояние заблокировано
+    assert result.initial_report.i_block_multiplier == 0.0
+    assert result.initial_report.final_uzi == 0.0
+    assert result.initial_report.compliance_status == "NON_COMPLIANT_BLOCKED"
+    assert len(result.initial_report.opa_denials) >= 3
+
+    # Ремедиированное состояние полностью восстановлено
+    assert result.remediated_report.i_block_multiplier == 1.0
+    assert result.remediated_report.final_uzi >= 0.94
+    assert result.remediated_report.compliance_status == "COMPLIANT_K1"
+    assert result.is_target_met is True
+    assert result.delta_uzi >= 0.94
+
+    # Проверка примененных действий
+    assert any("SSH 22" in a for a in result.applied_actions)
+    assert any("8000" in a for a in result.applied_actions)
+    assert any("MTU" in a for a in result.applied_actions)
+    assert any("Z3 Split-Tunneling" in a for a in result.applied_actions)
+
+    # Проверка синтезированного защищенного конфига
+    assert "@any to 10.55.10.1 port 22" not in result.remediated_config_text
+    assert "10.221.0.0/24 to 10.55.10.1 port 22" in result.remediated_config_text
+    assert "mtu = 1360" in result.remediated_config_text
+
+
+def test_whatif_explicit_remediation_actions() -> None:
+    engine = VipnetAstAndUziEngine()
+    config = (
+        "[local]\n"
+        "rule = num 1 proto tcp from @any to 10.55.10.1 port 22 pass\n"
+    )
+    result = engine.simulate_remediation_what_if(
+        config_or_rules=config,
+        remediations=[
+            RemediationAction(
+                action_type="CLOSE_PORT",
+                target_rule_id="FW-LOCAL-1",
+                description="Полное закрытие порта 22 действием deny",
+            )
+        ],
+    )
+    patched_rule = next(r for r in result.remediated_rules if r.rule_id == "FW-LOCAL-1")
+    assert patched_rule.effect == "deny"
+    assert result.remediated_report.i_block_multiplier == 1.0
+
+
+def test_fastapi_remediation_endpoint() -> None:
+    from fastapi.testclient import TestClient
+
+    from src.api.main import app
+
+    client = TestClient(app)
+    bad_conf = (
+        "[local]\n"
+        "rule = num 1 proto tcp from @any to 10.55.10.1 port 22 pass\n"
+    )
+    resp = client.post(
+        "/v1/vipnet/simulate-remediation",
+        json={
+            "config_text": bad_conf,
+            "target_threshold": 0.85,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["initial_report"]["final_uzi"] == 0.0
+    assert data["remediated_report"]["final_uzi"] >= 0.85
+    assert data["is_target_met"] is True
+    assert len(data["applied_actions"]) >= 1
+

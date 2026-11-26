@@ -172,3 +172,31 @@ class StreebogAuditRecord(BaseModel):
     payload_summary: dict[str, Any]
     prev_hash: str = Field(..., min_length=64, max_length=64)
     streebog256_hash: str = Field(..., min_length=64, max_length=64)
+
+
+class RemediationAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action_type: Literal[
+        "CLOSE_PORT",
+        "RESTRICT_SUBNET",
+        "FIX_MTU",
+        "ADD_ENCRYPT_TUNNEL",
+        "DROP_UNENCRYPTED",
+    ]
+    target_rule_id: str | None = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    description: str = Field(default="")
+
+
+class WhatIfRemediationResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    initial_report: FstecUziReport
+    remediated_report: FstecUziReport
+    delta_uzi: float
+    is_target_met: bool
+    applied_actions: list[str] = Field(default_factory=list)
+    remediated_rules: list[SecurityRuleNode] = Field(default_factory=list)
+    remediated_config_text: str = Field(default="")
+
