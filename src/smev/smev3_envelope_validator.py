@@ -2,9 +2,11 @@
 # Владелец: Селезнева Ольга Сергеевна (@wauwho, SC @tmafles) — Команда А2.2
 from __future__ import annotations
 
+import io
 import ipaddress
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
@@ -28,6 +30,11 @@ class SmevValidationResult:
 class Smev3EnvelopeValidator:
     """
     Валидатор XML/JSON-конвертов СМЭВ 3.0 и обращений граждан по 59-ФЗ для шлюза «Щит-АИСТ / СМЭВ-Guard».
+    Реализует требования задач S-09 и S-10 (КТ-2):
+    1) Защита от XXE (CWE-611) и XML Bomb / Billion Laughs (CWE-776);
+    2) Детекция SSRF (CWE-918) в URL и извлечённом тексте (IPv4/v6/hex/octal/decimal/DNS-rebinding);
+    3) Инспекция вложений на активный код (макросы MS Office, активные скрипты PDF);
+    4) Проверка квот размера и целостности SHA-256.
     """
 
     MAX_XML_BYTES: int = 2 * 1024 * 1024  # 2 МБ на конверт СМЭВ 3.0
@@ -40,7 +47,7 @@ class Smev3EnvelopeValidator:
         re.IGNORECASE,
     )
 
-    # Поиск любых URI (включая опасные схемы file://, gopher://, dict://, ftp://, ldap://) для фильтрации SSRF/LFI
+    # Поиск любых URI для фильтрации SSRF/LFI
     _URL_EXTRACTOR_RE = re.compile(
         r"\b(?:https?|file|gopher|dict|ftp|ldap|ldaps|tftp|ws|wss)://[^\s<>\"')]+",
         re.IGNORECASE,
@@ -81,6 +88,7 @@ class Smev3EnvelopeValidator:
             "text/plain",
             "application/xml",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "image/jpeg",
             "image/png",
         }
@@ -163,19 +171,46 @@ class Smev3EnvelopeValidator:
         host: str,
     ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         """
-        Распознаёт стандартные IPv4/IPv6-адреса, целочисленные 32-битные IP (например, 182255640 -> 10.221.0.24)
-        и шестнадцатеричные IP-литералы (0x7f000001 -> 127.0.0.1), используемые для обхода SSRF-фильтров.
+        Распознаёт стандартные IPv4/IPv6-адреса, целочисленные 32-битные IP (например, 182255640 -> 10.221.0.24),
+        шестнадцатеричные IP-литералы (0x7f000001 -> 127.0.0.1, 0x0a.0xdd.0x00.0x18) и октальные формы.
         """
-        if host.isdigit():
-            val = int(host)
+        clean_host = host.split(":")[0].strip("[]")
+        # 1. Десятичное число (32-bit integer)
+        if clean_host.isdigit():
+            val = int(clean_host)
             if 0 <= val <= 0xFFFFFFFF:
                 return ipaddress.IPv4Address(val)
-        if host.startswith("0x") and all(c in "0123456789abcdef" for c in host[2:]):
-            val = int(host, 16)
-            if 0 <= val <= 0xFFFFFFFF:
-                return ipaddress.IPv4Address(val)
+
+        # 2. Hex-число (например, 0x7f000001)
+        if clean_host.startswith("0x") and all(c in "0123456789abcdefABCDEF" for c in clean_host[2:]):
+            try:
+                val = int(clean_host, 16)
+                if 0 <= val <= 0xFFFFFFFF:
+                    return ipaddress.IPv4Address(val)
+            except ValueError:
+                pass
+
+        # 3. Точечно-шестнадцатеричная или точечно-октальная нотация (0x7f.0.0.1 / 0177.0.0.1)
+        parts = clean_host.split(".")
+        if len(parts) == 4:
+            parsed_octets: list[int] = []
+            for p in parts:
+                try:
+                    if p.startswith(("0x", "0X")):
+                        parsed_octets.append(int(p, 16))
+                    elif p.startswith("0") and len(p) > 1 and p.isdigit():
+                        parsed_octets.append(int(p, 8))
+                    elif p.isdigit():
+                        parsed_octets.append(int(p, 10))
+                    else:
+                        break
+                except ValueError:
+                    break
+            if len(parsed_octets) == 4 and all(0 <= o <= 255 for o in parsed_octets):
+                return ipaddress.IPv4Address(bytes(parsed_octets))
+
         try:
-            return ipaddress.ip_address(host)
+            return ipaddress.ip_address(clean_host)
         except ValueError:
             return None
 
@@ -217,6 +252,19 @@ class Smev3EnvelopeValidator:
                     f"CRITICAL SSRF BLOCK: Попытка обращения к защищённому внутреннему IP ГИС '{ip_obj}'!"
                 )
 
+    def _inspect_container_for_macros(self, raw_bytes: bytes, filename: str) -> None:
+        """Инспектирует бинарный поток DOCX/XLSX/ZIP на наличие бинарных VBA-проектов (vbaProject.bin)."""
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw_bytes)) as z:
+                for name in z.namelist():
+                    lower_name = name.lower()
+                    if "vbaproject.bin" in lower_name or "vba" in lower_name:
+                        raise SmevSecurityViolationError(
+                            f"CRITICAL MACRO/EXEC BLOCK: В архивном контейнере '{filename}' обнаружен исполняемый модуль VBA: {name}!"
+                        )
+        except zipfile.BadZipFile:
+            pass
+
     def _validate_attachment(self, att: SmevAttachmentMeta, warnings: list[str]) -> None:
         if att.mime_type not in self.ALLOWED_MIME_TYPES:
             raise SmevSecurityViolationError(
@@ -238,11 +286,13 @@ class Smev3EnvelopeValidator:
             raise SmevSecurityViolationError(
                 f"CRITICAL MACRO/EXEC BLOCK: Запрещённое расширение файла вложения '{att.filename}'!"
             )
+
         for pattern in self._MALICIOUS_ATTACHMENT_PATTERNS:
             if pattern.search(att.extracted_text):
                 raise SmevSecurityViolationError(
                     f"CRITICAL PAYLOAD BLOCK: Во вложении '{att.filename}' обнаружена сигнатура макроса или активного скрипта!"
                 )
+
         self._check_no_internal_ssrf_urls(att.extracted_text)
         if len(att.extracted_text) > 20000:
             warnings.append(
