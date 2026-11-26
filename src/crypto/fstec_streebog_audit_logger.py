@@ -1,8 +1,15 @@
 # src/crypto/fstec_streebog_audit_logger.py
 # Владелец: Панфилов Алексей Владимирович (@yo5hh, SC @nyamskiy) — Команда А2.2
+#
+# P-11: Реализация криптографического хеширования по ГОСТ Р 34.11-2012 («Стрибог-256»)
+#        и дерева Меркла (Merkle Tree) для неизменяемого журнала аудита ГИС К1.
+#        Включает: полную встроенную реализацию 12-раундовой сети LPSX c полем Галуа GF(2^64),
+#        генерацию и верификацию инклюзивных доказательств Меркла (Merkle Inclusion Proof),
+#        экспорт подписанного пакетного манифеста для архивации в ГосСОПКА / SOC.
 from __future__ import annotations
 
 import json
+import math
 import struct
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -293,6 +300,74 @@ class FstecStreebogAuditLogger:
             layer = next_layer
         return layer[0]
 
+    def compute_merkle_tree_height(self) -> int:
+        """Вычисляет высоту дерева Меркла (число уровней над листьями) для текущего журнала."""
+        n = len(self._records)
+        if n <= 1:
+            return 0
+        return math.ceil(math.log2(n))
+
+    def generate_merkle_inclusion_proof(
+        self, record_index: int
+    ) -> list[tuple[str, Literal["L", "R"]]]:
+        """
+        Генерирует инклюзивное доказательство Меркла (Merkle Inclusion Proof) для записи
+        с индексом ``record_index`` (0-based). Доказательство — список пар
+        ``(sibling_hash, direction)``, где ``direction`` указывает, с какой стороны
+        находится сиблинг при конкатенации (``'L'`` — слева, ``'R'`` — справа).
+        Верификатор, имея хеш записи, проходит путь от листа к корню и сравнивает
+        результат с ``compute_merkle_root_streebog()``.
+        """
+        if not self._records:
+            return []
+        if record_index < 0 or record_index >= len(self._records):
+            msg = (
+                f"Индекс записи {record_index} вне диапазона "
+                f"[0, {len(self._records) - 1}]"
+            )
+            raise IndexError(msg)
+
+        layer: list[str] = [rec.streebog256_hash for rec in self._records]
+        proof: list[tuple[str, Literal["L", "R"]]] = []
+        idx = record_index
+
+        while len(layer) > 1:
+            if len(layer) % 2 == 1:
+                layer.append(layer[-1])
+            next_layer: list[str] = []
+            for i in range(0, len(layer), 2):
+                if i == idx or i + 1 == idx:
+                    sibling_idx = i + 1 if idx == i else i
+                    direction: Literal["L", "R"] = "L" if sibling_idx < idx else "R"
+                    proof.append((layer[sibling_idx], direction))
+                combined = bytes.fromhex(layer[i]) + bytes.fromhex(layer[i + 1])
+                next_layer.append(gost_streebog256_hex(combined))
+            idx = idx // 2
+            layer = next_layer
+
+        return proof
+
+    @staticmethod
+    def verify_merkle_inclusion_proof(
+        leaf_hash: str,
+        proof: list[tuple[str, Literal["L", "R"]]],
+        expected_root: str,
+    ) -> bool:
+        """
+        Верифицирует инклюзивное доказательство Меркла: проходит путь от листа к корню,
+        применяя хеширование Стрибог-256 на каждом уровне, и сравнивает с ожидаемым корнем.
+
+        Возвращает ``True``, если доказательство валидно, ``False`` — если целостность нарушена.
+        """
+        current = leaf_hash
+        for sibling_hash, direction in proof:
+            if direction == "L":
+                combined = bytes.fromhex(sibling_hash) + bytes.fromhex(current)
+            else:
+                combined = bytes.fromhex(current) + bytes.fromhex(sibling_hash)
+            current = gost_streebog256_hex(combined)
+        return current == expected_root
+
     def export_signed_batch_manifest(self) -> dict[str, Any]:
         """Формирует подписанный манифест пакета записей аудита для архивации в ГосСОПКА / SOC."""
         chain_ok, broken_seq, status_msg = self.verify_chain_integrity()
@@ -305,5 +380,6 @@ class FstecStreebogAuditLogger:
             "broken_seq_id": broken_seq,
             "status_message": status_msg,
             "merkle_root_streebog256": merkle_root,
+            "merkle_tree_height": self.compute_merkle_tree_height(),
             "head_streebog256": self._records[-1].streebog256_hash if self._records else self.GENESIS_PREV_HASH,
         }

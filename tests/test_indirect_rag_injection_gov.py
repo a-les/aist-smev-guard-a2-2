@@ -1086,4 +1086,142 @@ def test_p10_z3_smt_cidr_whitespace_and_casing_robustness() -> None:
     assert str(net3) == "0.0.0.0/0"
 
 
+def test_p11_streebog256_merkle_tree_height_and_inclusion_proof() -> None:
+    from src.crypto.fstec_streebog_audit_logger import FstecStreebogAuditLogger
+
+    logger = FstecStreebogAuditLogger()
+    assert logger.compute_merkle_tree_height() == 0
+    assert logger.generate_merkle_inclusion_proof(0) == []
+
+    records = [
+        logger.append_security_event(
+            actor=f"GATEWAY-{i}",
+            citizen_session_id=f"SESS-{i}",
+            event_type="SMEV_APPEAL_PROCESSED",
+            severity="INFO",
+            payload_summary={"idx": i},
+        )
+        for i in range(5)
+    ]
+
+    assert logger.compute_merkle_tree_height() == 3
+    merkle_root = logger.compute_merkle_root_streebog()
+    assert len(merkle_root) == 64
+
+    for idx, rec in enumerate(records):
+        proof = logger.generate_merkle_inclusion_proof(idx)
+        assert len(proof) == 3
+        assert FstecStreebogAuditLogger.verify_merkle_inclusion_proof(
+            rec.streebog256_hash, proof, merkle_root
+        )
+
+    # Подмена хеша листа должна ломать верификацию инклюзивного доказательства
+    tampered_leaf = ("0" if records[2].streebog256_hash[0] != "0" else "1") + records[2].streebog256_hash[1:]
+    proof_2 = logger.generate_merkle_inclusion_proof(2)
+    assert not FstecStreebogAuditLogger.verify_merkle_inclusion_proof(
+        tampered_leaf, proof_2, merkle_root
+    )
+
+    manifest = logger.export_signed_batch_manifest()
+    assert manifest["chain_valid"] is True
+    assert manifest["merkle_tree_height"] == 3
+    assert manifest["merkle_root_streebog256"] == merkle_root
+
+
+def test_p12_fastapi_gateway_metrics_and_endpoints() -> None:
+    from fastapi.testclient import TestClient
+
+    from src.api.main import app
+
+    client = TestClient(app)
+
+    audit_resp = client.get("/v1/audit/verify-chain")
+    assert audit_resp.status_code == 200
+    audit_body = audit_resp.json()
+    assert audit_body["chain_valid"] is True
+    assert "merkle_root_streebog256" in audit_body
+
+    metrics_resp = client.get("/metrics")
+    assert metrics_resp.status_code == 200
+    metrics_text = metrics_resp.text
+    assert "aist_guard_streebog_chain_valid" in metrics_text
+    assert "aist_guard_z3_findings_total" in metrics_text
+    assert "aist_guard_redteam_block_rate_percent" in metrics_text
+    assert "aist_guard_request_latency_ms" in metrics_text
+
+
+def test_p13_synthetic_59fz_dataset_and_checksums(tmp_path: Path) -> None:
+    import importlib
+    import random
+
+    from src.pii.ru_gov_pii_detector import verify_inn_checksum, verify_snils_checksum
+
+    p02 = importlib.import_module("pipelines.02_distilabel_gov_redteam_and_pii_synth")
+    rng = random.Random(12345)
+    for _ in range(10):
+        snils = p02._generate_valid_snils(rng)
+        inn = p02._generate_valid_inn_fl(rng)
+        assert verify_snils_checksum(snils) is True
+        ok_inn, _ = verify_inn_checksum(inn)
+        assert ok_inn is True
+
+    out_jsonl = tmp_path / "synth_test.jsonl"
+    summary = p02.generate_synthetic_dataset(
+        output_path=str(out_jsonl),
+        n_benign=20,
+        n_attacks=10,
+        n_boundary=5,
+        seed=42,
+    )
+    assert summary["total_records"] == 35
+    assert summary["benign_records"] == 25
+    assert summary["attack_records"] == 10
+    assert out_jsonl.exists()
+
+    lines = [json.loads(line) for line in out_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(lines) == 35
+    for rec in lines:
+        for ent in rec["pii_entities"]:
+            assert "value_hmac" in ent
+            assert "raw_value" not in ent
+
+
+def test_p14_setfit_deberta_dpo_grpo_pipeline(tmp_path: Path) -> None:
+    import importlib
+
+    p02 = importlib.import_module("pipelines.02_distilabel_gov_redteam_and_pii_synth")
+    p04 = importlib.import_module("pipelines.04_setfit_and_unsloth_dpo_guardrail")
+
+    ds_path = tmp_path / "synth_p14.jsonl"
+    p02.generate_synthetic_dataset(
+        output_path=str(ds_path),
+        n_benign=40,
+        n_attacks=20,
+        n_boundary=10,
+        seed=42,
+    )
+
+    out_dir = tmp_path / "p14_models"
+    report = p04.run_full_training_pipeline(
+        dataset_path=str(ds_path),
+        output_dir=str(out_dir),
+        n_dpo_pairs=20,
+        n_grpo_rollouts=8,
+        seed=42,
+    )
+    assert report["dataset_records"] == 70
+    assert report["audit_manifest"]["chain_valid"] is True
+    assert set(report["stages"].keys()) == {
+        "1_setfit_few_shot",
+        "2_deberta_onnx_int8",
+        "3_unsloth_dpo",
+        "4_trl_grpo_rlvr",
+    }
+    onnx_info = report["stages"]["2_deberta_onnx_int8"]["onnx_export"]
+    assert Path(onnx_info["weights_file"]).exists()
+    assert Path(onnx_info["config_file"]).exists()
+    assert (out_dir / "pipeline_04_report.json").exists()
+
+
+
 
