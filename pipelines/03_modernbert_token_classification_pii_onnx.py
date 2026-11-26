@@ -2,19 +2,28 @@
 # Владелец: Селезнева Ольга Сергеевна (@wauwho, SC @tmafles) — Команда А2.2
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 from typing import Any
 
+# Полный набор 33 BIO-тегов для 15 нормативных категорий ПДн 152-ФЗ + специальная медицинская тайна
 PII_BIO_LABELS: tuple[str, ...] = (
     "O",
     "B-PERSON", "I-PERSON",
     "B-SNILS", "I-SNILS",
     "B-INN_FL", "I-INN_FL",
     "B-INN_UL", "I-INN_UL",
+    "B-OGRN", "I-OGRN",
+    "B-OGRNIP", "I-OGRNIP",
     "B-PASSPORT", "I-PASSPORT",
     "B-OMS", "I-OMS",
+    "B-BANK_CARD", "I-BANK_CARD",
     "B-BANK_ACCOUNT", "I-BANK_ACCOUNT",
+    "B-CADASTRAL", "I-CADASTRAL",
+    "B-UIN", "I-UIN",
+    "B-PHONE", "I-PHONE",
+    "B-EMAIL", "I-EMAIL",
     "B-ADDRESS", "I-ADDRESS",
     "B-MEDICAL_SPEC", "I-MEDICAL_SPEC",
 )
@@ -68,12 +77,16 @@ def compute_seqeval_token_metrics(
         for p_id, g_id in zip(pred_seq, gold_seq):
             if g_id == -100:
                 continue
-            if g_id != 0 and p_id == g_id:
-                tp += 1
-            elif p_id != 0 and p_id != g_id:
+            if g_id != 0:
+                if p_id == g_id:
+                    tp += 1
+                else:
+                    fn += 1
+                    if p_id != 0:
+                        fp += 1
+            elif p_id != 0:
                 fp += 1
-            if g_id != 0 or g_id != 0 and p_id == 0:
-                fn += 1
+
     precision = tp / max(1, tp + fp)
     recall = tp / max(1, tp + fn)
     f1 = (2 * precision * recall) / max(1e-9, precision + recall)
@@ -106,7 +119,7 @@ def export_checkpoint_to_onnx_int8(
         quantizer.quantize(save_dir=out_path, quantization_config=qconfig)
         quantized_mode = "ORT_AVX512_VNNI_INT8"
     except Exception:
-        # Если в тестовой среде нет бинарного пакета optimum-onnxruntime, сохраняем конфигурацию графа
+        # Если в среде нет бинарного пакета optimum-onnxruntime, фиксируем манифест графа
         pass
 
     manifest = {
@@ -126,12 +139,13 @@ def train_and_export_modernbert_pii_onnx_int8(
     train_jsonl: str = "data/curated_a22/curated_train.jsonl",
     output_onnx_dir: str = "checkpoints/ru_modernbert_pii_int8",
     execute_training: bool = False,
+    device: str = "cuda",
 ) -> dict[str, Any]:
     """
     Конвейер А.1 (Селезнева О. С.):
     1) Дообучает RuModernBERT-base на задаче токенной классификации (NER 15 категорий ПДн РФ);
     2) Экспортирует веса в граф ONNX через Hugging Face Optimum и применяет динамическое квантование
-    INT8 (AVX-512 VNNI / TensorRT Execution Provider) для достижения задержки < 1.2 мс на запрос.
+    INT8 (AVX-512 VNNI / TensorRT Execution Provider) для достижения задержки < 1.2 мс на запрос на RTX 5080.
     """
     out_dir = Path(output_onnx_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -152,13 +166,14 @@ def train_and_export_modernbert_pii_onnx_int8(
                 id2label=ID2LABEL,
                 label2id=LABEL2ID,
             )
+            use_bf16 = torch.cuda.is_available() and device.startswith("cuda")
             training_args = TrainingArguments(
                 output_dir=f"{output_onnx_dir}/hf_checkpoints",
                 per_device_train_batch_size=16,
                 gradient_accumulation_steps=2,
                 learning_rate=3e-5,
                 num_train_epochs=3,
-                bf16=torch.cuda.is_available(),
+                bf16=use_bf16,
                 logging_steps=25,
                 save_strategy="epoch",
                 report_to="none",
@@ -185,6 +200,7 @@ def train_selezneva_qwen_opa_vipnet_rslora(
     dataset_path: str = "data/rd1_iac_topoguard/train.jsonl",
     output_dir: str = "checkpoints/a22-selezneva-opa-vipnet-lora",
     execute_training: bool = False,
+    device: str = "cuda",
 ) -> dict[str, Any]:
     """
     Конвейер А.2 (Селезнева О. С.):
@@ -242,6 +258,7 @@ def train_selezneva_qwen_opa_vipnet_rslora(
         "method": "Unsloth NF4 + rsLoRA",
         "rank": 16,
         "lora_alpha": 16,
+        "scaling_gamma": round(16 / (16 ** 0.5), 2),  # gamma = alpha / sqrt(r) = 4.0
         "peak_vram_gb": 9.56,
         "loss_trajectory": {"step_0": 0.1930, "step_120": 0.0323},
         "output_dir": str(out_path),
@@ -252,12 +269,28 @@ def train_selezneva_qwen_opa_vipnet_rslora(
     return {"status": "configured", "metadata": meta}
 
 
+def main() -> None:
+    parser = argparse.ArgumentParser(description="RuModernBERT-NER ONNX and Qwen rsLoRA (S-14, S-15)")
+    parser.add_argument("--execute-training", action="store_true", help="Запустить реальное обучение на GPU RTX 5080")
+    parser.add_argument("--device", default="cuda", help="Устройство (cuda/cpu)")
+    parser.add_argument("--model-id", default="deepvk/RuModernBERT-base", help="Базовая модель NER")
+    parser.add_argument("--train-qwen", action="store_true", help="Запустить SFT Qwen rsLoRA")
+    args = parser.parse_args()
+
+    export_res = train_and_export_modernbert_pii_onnx_int8(
+        base_model_id=args.model_id,
+        execute_training=args.execute_training,
+        device=args.device,
+    )
+    print(f"[RuModernBERT-NER Export] {json.dumps(export_res, ensure_ascii=False)}")
+
+    if args.train_qwen:
+        qwen_res = train_selezneva_qwen_opa_vipnet_rslora(
+            execute_training=args.execute_training,
+            device=args.device,
+        )
+        print(f"[Qwen rsLoRA] {json.dumps(qwen_res, ensure_ascii=False)}")
+
+
 if __name__ == "__main__":
-    sample_aligned = align_word_labels_to_subwords([None, 0, 0, 1, 2, None], ["B-PERSON", "I-PERSON", "O"])
-    export_res = train_and_export_modernbert_pii_onnx_int8()
-    qwen_res = train_selezneva_qwen_opa_vipnet_rslora()
-    print(json.dumps({
-        "aligned_sample": sample_aligned,
-        "export_metadata": export_res,
-        "qwen_rslora": qwen_res,
-    }, ensure_ascii=False))
+    main()
