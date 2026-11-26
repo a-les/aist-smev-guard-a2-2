@@ -41,7 +41,8 @@ else
     log_info "Мост ${BRIDGE_NAME} уже существует."
 fi
 
-# Включаем NAT для выхода лабораторной подсети к пакетному кэшу NixOS
+# Включаем IP forwarding и NAT для выхода лабораторной подсети к пакетному кэшу NixOS
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 iptables -t nat -C POSTROUTING -s 10.221.0.0/24 ! -d 10.221.0.0/24 -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -s 10.221.0.0/24 ! -d 10.221.0.0/24 -j MASQUERADE
 
@@ -73,7 +74,7 @@ clone_and_configure_vm() {
         --balloon 0 \
         --net0 "virtio,bridge=${BRIDGE_NAME},firewall=1" \
         --ipconfig0 "ip=${ip_addr}/24,gw=10.221.0.1" \
-        --nameserver "1.1.1.1 8.8.8.8" \
+        --nameserver "10.55.10.254 1.1.1.1 8.8.8.8" \
         --agent enabled=1 \
         --onboot 1 \
         --ostype l26 \
